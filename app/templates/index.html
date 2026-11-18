@@ -32,6 +32,13 @@ code { background:var(--bg); padding:1px 5px; border-radius:4px; }
 details { margin:2px 0 10px; }
 summary { cursor:pointer; }
 .nullcell { color:#9a6700; font-size:12px; }
+.warn { color:#9a6700; }
+.short { color:var(--bad); font-weight:600; }
+.pill { display:inline-block; font-size:11px; border-radius:10px; padding:1px 8px; background:#ddf4ff; color:#0969da; }
+.pill.conflict { background:#ffebe9; color:var(--bad); }
+.pill.empty { background:#eaeef2; color:#57606a; }
+.pill.claimed { background:#fff8c5; color:#7d4e00; }
+.pill.eligible { background:#dafbe1; color:var(--ok); }
 </style>
 </head>
 <body>
@@ -81,6 +88,28 @@ summary { cursor:pointer; }
 <section id="sec-batches">
   <h2>⑥ 批次列表</h2>
   <div id="batches-box"></div>
+</section>
+
+<section id="sec-sampling">
+  <h2>⑦ 抽样清单（UTC 周 · 站号 · 稳定列）</h2>
+  <p class="muted">每站每周抽取指定数量的有值小时。同站同小时重复上传只占一个候选位置；
+    异值列为待核并排除。清单发布后保留当时的候选范围与选中读数，补传 / 换版不会改动旧清单；
+    新轮次不再领用前轮已交的站点小时，名额不足会标出缺额。</p>
+  <div class="row">
+    <label>UTC 周 <input id="s-week" placeholder="2026-W47 或 2026-11-16"></label>
+    <label>抽样列 <select id="s-column"></select></label>
+    <label>每站数量 <input id="s-per" type="number" min="1" max="168" value="2" style="width:70px"></label>
+    <label>种子 <input id="s-seed" placeholder="可空=自动生成"></label>
+    <label>备注 <input id="s-note" placeholder="可选"></label>
+    <button onclick="createRound()">生成并发布清单</button>
+  </div>
+  <div id="sampling-msg" class="msg"></div>
+  <div id="sampling-rounds"></div>
+</section>
+
+<section id="sec-claims">
+  <h2>⑧ 已领用样本（跨轮次锁定，不再参与后续抽样）</h2>
+  <div id="claims-box"></div>
 </section>
 
 </main>
@@ -236,6 +265,7 @@ async function uploadCsv(){
     const r = await api('/api/batches', { method:'POST', body: fd });
     msg.innerHTML = '<div class="ok">✓ 批次 #' + r.batch_id + ' 已按 v' + r.version_no + ' 入库，共 ' + r.row_count + ' 行</div>';
     await refresh();
+    await refreshSampling();
   }catch(e){ showErr(msg, e); }
 }
 
@@ -310,7 +340,159 @@ function renderBatches(){
   box.innerHTML = h + '</table>';
 }
 
-refresh().then(() => { if(state.current) doQuery(); })
+/* ---------- 抽样清单 ---------- */
+
+const STATUS_LABEL = { eligible:'合格未抽中', conflict:'待核(异值)', claimed:'前轮已领用', empty:'空值' };
+
+async function refreshSampling(){
+  const meta = await api('/api/sampling/meta');
+  const sel = $('s-column');
+  const cur = sel.value;
+  sel.innerHTML = meta.columns.map(c =>
+    '<option value="' + esc(c.column_id) + '">' + esc(c.name) + '（' + esc(c.column_id) + '）</option>').join('');
+  if(!meta.columns.length) sel.innerHTML = '<option value="">（现役结构无数据列）</option>';
+  if([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  if(!$('s-week').value) $('s-week').value = meta.current_week;
+
+  const box = $('claims-box');
+  if(!meta.claims.length){ box.innerHTML = '<p class="muted">尚无已领用样本。</p>'; }
+  else {
+    let h = '<table><tr><th>站号</th><th>UTC小时</th><th>读数</th><th>列标识</th><th>领用清单</th><th>原始批次</th><th>领用时间</th></tr>';
+    meta.claims.forEach(c => {
+      h += '<tr><td>' + esc(c.station) + '</td><td>' + esc(c.hour_utc) + '</td><td>' + esc(c.value) +
+        '</td><td><code>' + esc(c.column_id) + '</code></td><td>#' + c.round_id +
+        '</td><td>#' + c.batch_id + ' (v' + c.batch_version_no + ')</td><td>' + esc(c.created_at) + '</td></tr>';
+    });
+    box.innerHTML = h + '</table>';
+  }
+
+  const d = await api('/api/sampling/rounds');
+  renderRounds(d.rounds);
+}
+
+function renderRounds(rounds){
+  const box = $('sampling-rounds');
+  if(!rounds.length){ box.innerHTML = '<p class="muted">尚无抽样清单。</p>'; return; }
+  const openBefore = new Set(
+    [...box.querySelectorAll('details.round')].filter(el => el.open)
+      .map(el => el.getAttribute('data-id')));
+  let h = '';
+  rounds.forEach(r => {
+    h += '<details class="round" data-id="' + r.id + '"><summary><b>清单 #' + r.id + '</b> · ' +
+      esc(r.week_label) + '（' + esc(r.week_start) + ' ~ ' + esc(r.week_end) + '）· 列「' +
+      esc(r.column.name) + '」<code>' + esc(r.column.column_id) + '</code> · 每站 ' + r.per_station +
+      ' · 抽中 ' + r.selected_count + ' 个' +
+      (r.shortfall ? ' · <span class="short">缺额 ' + r.shortfall + ' 个</span>' : '') +
+      ' <span class="muted">' + esc(r.created_at) + '</span></summary>' +
+      '<div class="round-body" data-loaded="0"></div></details>';
+  });
+  box.innerHTML = h;
+  box.querySelectorAll('details.round').forEach(el => {
+    el.addEventListener('toggle', () => { if(el.open) loadRound(el); });
+    if(openBefore.has(el.getAttribute('data-id'))){
+      el.open = true;          // 保持展开，快照内容重新拉取
+      loadRound(el);
+    }
+  });
+}
+
+async function loadRound(el){
+  const body = el.querySelector('.round-body');
+  if(body.getAttribute('data-loaded') === '1') return;
+  const id = el.getAttribute('data-id');
+  try{
+    const d = await api('/api/sampling/rounds/' + id);
+    body.setAttribute('data-loaded', '1');
+    body.innerHTML = roundHtml(d);
+  }catch(e){ showErr(body, e); }
+}
+
+function roundHtml(d){
+  let h = '<div class="row"><span class="muted">种子 <code>' + esc(d.seed) + '</code>（' +
+    (d.seed_source === 'generated' ? '自动生成，可用它复算' : '人工指定') + '）· 算法 <code>' +
+    esc(d.algorithm) + '</code> · 清单结构版本 v' + d.structure_version_no +
+    (d.note ? ' · ' + esc(d.note) : '') + '</span>' +
+    '<a href="/api/sampling/rounds/' + d.id + '/csv"><button class="ghost">下载 CSV</button></a></div>';
+
+  h += '<p class="muted">各站情况</p><table><tr><th>站号</th><th>申请</th><th>实抽</th><th>缺额</th>' +
+    '<th>合格</th><th>待核</th><th>前轮已领用</th><th>空值</th><th>异常</th><th>说明</th></tr>';
+  d.stations.forEach(s => {
+    h += '<tr><td>' + esc(s.station) + '</td><td>' + s.requested + '</td><td>' + s.selected_count +
+      '</td><td' + (s.shortfall ? ' class="short"' : '') + '>' + s.shortfall + '</td><td>' + s.eligible_count +
+      '</td><td>' + s.conflict_count + '</td><td>' + s.claimed_count + '</td><td>' + s.empty_count +
+      '</td><td' + (s.warning_count ? ' class="short"' : '') + '>' + (s.warning_count || 0) +
+      '</td><td class="muted">' + esc(s.reason) + '</td></tr>';
+  });
+  h += '</table>';
+
+  const warned = d.candidates.filter(c => c.warnings && c.warnings.length);
+  if(warned.length){
+    h += '<p class="short">已交样本异常提示</p><ul class="err-list">';
+    warned.forEach(c => c.warnings.forEach(w => {
+      h += '<li>站 ' + esc(c.station) + ' ' + esc(c.hour_utc) + '：' + esc(w) + '</li>';
+    }));
+    h += '</ul>';
+  }
+
+  h += '<p class="muted">选中读数（发布时快照）</p>';
+  if(!d.selected.length){ h += '<p class="warn">本轮没有可抽取的候选。</p>'; }
+  else {
+    h += '<table><tr><th>站号</th><th>UTC小时</th><th>读数</th><th>原始批次</th><th>批次结构版本</th></tr>';
+    d.selected.forEach(c => {
+      h += '<tr><td>' + esc(c.station) + '</td><td>' + esc(c.hour_utc) + '</td><td>' +
+        esc(c.selected_value) + '</td><td>#' + c.selected_batch_id + '</td><td>v' +
+        c.selected_batch_version_no + '</td></tr>';
+    });
+    h += '</table>';
+  }
+
+  if(d.conflicts.length){
+    h += '<p class="warn">待核记录（异值，已排除抽样）</p><table><tr><th>站号</th><th>UTC小时</th><th>各批次读数</th></tr>';
+    d.conflicts.forEach(c => {
+      const rd = c.readings.map(x => '#' + x.batch_id + '(v' + x.batch_version_no + ')=' +
+        (x.value === null ? '空' : x.value)).join('；');
+      h += '<tr><td>' + esc(c.station) + '</td><td>' + esc(c.hour_utc) + '</td><td>' + esc(rd) + '</td></tr>';
+    });
+    h += '</table>';
+  }
+
+  h += '<details><summary class="muted">全部候选（' + d.candidates.length + ' 条，含状态与原始读数）</summary>' +
+    '<table><tr><th>站号</th><th>UTC小时</th><th>状态</th><th>抽中</th><th>读数</th><th>各批次读数</th><th>说明</th></tr>';
+  d.candidates.forEach(c => {
+    const rd = c.readings.map(x => '#' + x.batch_id + '(v' + x.batch_version_no + ')=' +
+      (x.value === null ? '空' : x.value)).join('；');
+    h += '<tr><td>' + esc(c.station) + '</td><td>' + esc(c.hour_utc) + '</td><td><span class="pill ' +
+      esc(c.status) + '">' + (STATUS_LABEL[c.status] || esc(c.status)) + '</span></td><td>' +
+      (c.selected ? '✓' : '') + '</td><td>' + (c.value === null ? '<span class="nullcell">（空）</span>' : esc(c.value)) +
+      '</td><td class="muted">' + esc(rd) + '</td><td class="muted">' + esc(c.reason) + '</td></tr>';
+  });
+  h += '</table></details>';
+  return h;
+}
+
+async function createRound(){
+  const msg = $('sampling-msg'); msg.innerHTML = '';
+  const body = {
+    week: $('s-week').value.trim(),
+    column_id: $('s-column').value,
+    per_station: parseInt($('s-per').value, 10),
+    note: $('s-note').value.trim(),
+  };
+  const seed = $('s-seed').value.trim();
+  if(seed) body.seed = seed;
+  try{
+    const d = await api('/api/sampling/rounds', { method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    msg.innerHTML = '<div class="ok">✓ 清单 #' + d.id + ' 已发布：' + esc(d.week_label) + '，' +
+      d.selected.length + ' 个选中' +
+      (d.stations.some(s => s.shortfall) ? '，<span class="short">存在缺额</span>' : '') + '</div>';
+    await refreshSampling();
+    const el = document.querySelector('details.round[data-id="' + d.id + '"]');
+    if(el){ el.open = true; loadRound(el); el.scrollIntoView({behavior:'smooth'}); }
+  }catch(e){ showErr(msg, e); }
+}
+
+refresh().then(() => { if(state.current) doQuery(); return refreshSampling(); })
   .catch(e => { $('current-box').innerHTML = '<div class="err">加载失败：' + esc(e.message || e) + '</div>'; });
 </script>
 </body>

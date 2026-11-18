@@ -5,10 +5,10 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import Body, FastAPI, File, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 
-from . import core
+from . import core, sampling
 from .db import init_db, session
 
 MAX_CSV_BYTES = 20 * 1024 * 1024
@@ -106,3 +106,54 @@ def api_observations(
             conn, station=station, hour_from=hf, hour_to=ht,
             version_no=version_no, limit=limit,
         )
+
+
+# ---------------------------------------------------------------- 抽样清单
+
+@app.get("/api/sampling/meta")
+def api_sampling_meta():
+    """页面辅助：当前 UTC 周、抽样列候选、已领用样本。"""
+    week = sampling.current_week()
+    with session() as conn:
+        active = core.get_active_version(conn)
+        columns = []
+        if active is not None:
+            columns = [c for c in core.version_columns(conn, active["id"])
+                       if c["type"] not in ("station", "hour")]
+        return {
+            "current_week": week["label"],
+            "week_start": week["week_start"],
+            "week_end": week["week_end"],
+            "active_version_no": active["version_no"] if active else None,
+            "columns": columns,
+            "claims": sampling.list_claims(conn),
+        }
+
+
+@app.get("/api/sampling/rounds")
+def api_list_rounds(week: str | None = None):
+    label = sampling.parse_week(week)["label"] if week else None
+    with session() as conn:
+        return {"rounds": sampling.list_rounds(conn, label)}
+
+
+@app.post("/api/sampling/rounds", status_code=201)
+def api_create_round(spec: dict = Body(...)):
+    with session() as conn:
+        return sampling.create_round(conn, spec)
+
+
+@app.get("/api/sampling/rounds/{round_id}")
+def api_get_round(round_id: int):
+    with session() as conn:
+        return sampling.get_round(conn, round_id)
+
+
+@app.get("/api/sampling/rounds/{round_id}/csv")
+def api_round_csv(round_id: int):
+    with session() as conn:
+        filename, text = sampling.round_csv(conn, round_id)
+    return PlainTextResponse(
+        text, media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
